@@ -566,6 +566,7 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
                                     '1' if self.cmbResEnable.currentIndex() == 0 else '0')
                 self._zcan.ReleaseIProperty(ip)
 
+            # set usbcan-e-u baudrate
             if self._cur_dev_info["dev_type"] in USBCAN_XE_U_TYPE:
                 ip = self._zcan.GetIProperty(self._dev_handle)
                 self._zcan.SetValue(ip,
@@ -573,13 +574,17 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
                                     self._cur_dev_info["chn_info"]["baudrate"][self.cmbBaudrate.currentText()])
                 self._zcan.ReleaseIProperty(ip)
 
+            # set usbcanfd clock
             if self._cur_dev_info["dev_type"] in USBCANFD_TYPE:
                 ip = self._zcan.GetIProperty(self._dev_handle)
                 self._zcan.SetValue(ip, str(self.cmbCANChn.currentIndex()) + "/clock", "60000000")
                 self._zcan.ReleaseIProperty(ip)
 
+
+            # 初始化通道配置
             chn_cfg = ZCAN_CHANNEL_INIT_CONFIG()
             chn_cfg.can_type = ZCAN_TYPE_CANFD if self._is_canfd else ZCAN_TYPE_CAN
+
             chn_cfg.config.can.mode = 0
             if self._cur_dev_info["dev_type"] in USBCAN_I_II_TYPE:
                 brt = self._cur_dev_info["chn_info"]["baudrate"][self.cmbBaudrate.currentText()]
@@ -588,11 +593,13 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
                 chn_cfg.config.can.acc_code = 0
                 chn_cfg.config.can.acc_mask = 0xFFFFFFFF
 
+            # 初始化 CAN 通道
             self._can_handle = self._zcan.InitCAN(self._dev_handle, self.cmbCANChn.currentIndex(), chn_cfg)
             if self._can_handle == INVALID_CHANNEL_HANDLE:
                 self.show_message_box("打开通道", "初始化通道失败！", QMessageBox.Critical)
                 return
 
+            # 启动 CAN 通道
             ret = self._zcan.StartCAN(self._can_handle)
             if ret != ZCAN_STATUS_OK:
                 self.show_message_box("打开通道", "打开通道失败！", QMessageBox.Critical)
