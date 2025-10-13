@@ -1,8 +1,10 @@
 """
 V1.2 每个包分为前半包和后半包，发送间隔100ms
+V1.3 收到 NACK 时重传整个原始包（不再区分前后半包）
 """
 
 
+from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QMessageBox, QFileDialog
@@ -77,12 +79,13 @@ class BootloaderWorker(QThread):
         self._can_handle = can_handle
         self._stop_requested = False
 
-        # 复用主窗口的 CRC 和发送逻辑（简化）
         self._timeout = 10.0
         self._ack_received = threading.Event()
-        self._nack_info = None
+        self._nack_info = None  # (block_index, packet_index)
         self._expected_ack_id = None
         self._current_block_index = -1
+        self._retry_count = {}  # {(block, pkt): count}
+        self._max_retries = 3
 
     def stop(self):
         self._stop_requested = True
@@ -119,9 +122,10 @@ class BootloaderWorker(QThread):
                 start = block_index * BLOCK_SIZE
                 end = min(start + BLOCK_SIZE, len(firmware))
                 block_data = firmware[start:end]
-                original_packets = len(block_data) // 8
+                original_packets = (len(block_data) + 7) // 8  # 向上取整
                 total_original_packets += original_packets
 
+            self.log_message.emit("📌 Bootloader V1.3（NACK 触发整包重传）")
             self.log_message.emit(f"🚀 开始 Bootloader 固件传输")
             self.log_message.emit(f"📁 文件: {os.path.basename(self.bin_path)}")
             self.log_message.emit(f"📦 大小: {len(firmware)} 字节 | 📦 原始包数: {total_original_packets}")
@@ -144,7 +148,7 @@ class BootloaderWorker(QThread):
                 self.log_message.emit(f"\n📥 发送块 {block_index} (0x{start:06X} - 0x{end - 1:06X})")
 
                 ORIGINAL_PACKET_SIZE = 8
-                original_packets = len(block_data) // ORIGINAL_PACKET_SIZE
+                original_packets = (len(block_data) + 7) // 8  # 向上取整
 
                 orig_pkt_idx = 0
                 while orig_pkt_idx < original_packets:
@@ -152,57 +156,72 @@ class BootloaderWorker(QThread):
                         self.finished.emit(False, "用户中止")
                         return
 
-                    # 检查是否需要重传
+                    # === 检查是否需要重传 ===
                     if self._nack_info and self._nack_info[0] == block_index:
-                        # 重传指定的半包
-                        nack_block, nack_pkt, nack_half = self._nack_info
+                        nack_block, nack_pkt = self._nack_info
                         if nack_pkt >= original_packets:
                             self.finished.emit(False, f"无效 NACK: 包索引 {nack_pkt} 超出范围")
                             return
 
-                        # 获取原始数据
+                        # 重传计数
+                        retry_key = (nack_block, nack_pkt)
+                        self._retry_count[retry_key] = self._retry_count.get(retry_key, 0) + 1
+                        if self._retry_count[retry_key] > self._max_retries:
+                            self.finished.emit(False, f"包 {nack_pkt} 重传超过 {self._max_retries} 次，放弃")
+                            return
+
+                        # 获取原始数据（8字节）
                         p_start = nack_pkt * ORIGINAL_PACKET_SIZE
                         original_payload = block_data[p_start:p_start + 8]
+                        if len(original_payload) < 8:
+                            original_payload += b'\x00' * (8 - len(original_payload))
 
-                        if nack_half == 0:  # 重传前半包
-                            send_data = bytearray(8)
-                            send_data[0] = (nack_pkt >> 8) & 0xFF
-                            send_data[1] = nack_pkt & 0xFF
-                            send_data[2] = 0x00
-                            send_data[3:7] = original_payload[0:4]
-                            send_data[7] = crc8(bytes(send_data[:7]))
+                        self.log_message.emit(
+                            f"  🔄 重传整个包 {nack_pkt} | ID=0x{0x100 + block_index:03X} | Data={' '.join(f'{b:02X}' for b in original_payload)}"
+                        )
 
-                            can_id = 0x100 + block_index
-                            if not self._send_can_message_direct(can_id, send_data):
-                                self.finished.emit(False, f"重传失败: 块 {block_index}, 包 {nack_pkt} 前半包")
-                                return
+                        # 重传前半包
+                        send0_data = bytearray(8)
+                        send0_data[0] = (nack_pkt >> 8) & 0xFF
+                        send0_data[1] = nack_pkt & 0xFF
+                        send0_data[2] = 0x00
+                        send0_data[3:7] = original_payload[0:4]
+                        send0_data[7] = crc8(bytes(send0_data[:7]))
 
-                            send_hex = ' '.join(f"{b:02X}" for b in send_data)
-                            self.log_message.emit(f"    ↻ 重传前半包={send_hex}")
+                        can_id = 0x100 + block_index
+                        if not self._send_can_message_direct(can_id, send0_data):
+                            self.finished.emit(False, f"重传失败: 块 {block_index}, 包 {nack_pkt} 前半包")
+                            return
 
-                        else:  # 重传后半包
-                            send_data = bytearray(8)
-                            send_data[0] = (nack_pkt >> 8) & 0xFF
-                            send_data[1] = nack_pkt & 0xFF
-                            send_data[2] = 0x01
-                            send_data[3:7] = original_payload[4:8]
-                            send_data[7] = crc8(bytes(send_data[:7]))
+                        send0_hex = ' '.join(f"{b:02X}" for b in send0_data)
+                        self.log_message.emit(f"    → 重传前半包={send0_hex}")
+                        time.sleep(0.1)
 
-                            can_id = 0x100 + block_index
-                            if not self._send_can_message_direct(can_id, send_data):
-                                self.finished.emit(False, f"重传失败: 块 {block_index}, 包 {nack_pkt} 后半包")
-                                return
+                        # 重传后半包
+                        send1_data = bytearray(8)
+                        send1_data[0] = (nack_pkt >> 8) & 0xFF
+                        send1_data[1] = nack_pkt & 0xFF
+                        send1_data[2] = 0x01
+                        send1_data[3:7] = original_payload[4:8]
+                        send1_data[7] = crc8(bytes(send1_data[:7]))
 
-                            send_hex = ' '.join(f"{b:02X}" for b in send_data)
-                            self.log_message.emit(f"    ↻ 重传后半包={send_hex}")
+                        if not self._send_can_message_direct(can_id, send1_data):
+                            self.finished.emit(False, f"重传失败: 块 {block_index}, 包 {nack_pkt} 后半包")
+                            return
+
+                        send1_hex = ' '.join(f"{b:02X}" for b in send1_data)
+                        self.log_message.emit(f"    → 重传后半包={send1_hex}")
+                        time.sleep(0.1)
 
                         self._nack_info = None
-                        time.sleep(0.1)  # 100ms 间隔
-                        continue  # 重传后继续检查是否有新的 NACK
+                        # 注意：不推进 orig_pkt_idx，下轮继续检查是否还需重传
+                        continue
 
                     # === 正常发送原始包的两个半包 ===
                     p_start = orig_pkt_idx * ORIGINAL_PACKET_SIZE
                     original_payload = block_data[p_start:p_start + 8]
+                    if len(original_payload) < 8:
+                        original_payload += b'\x00' * (8 - len(original_payload))
 
                     original_data_hex = ' '.join(f"{b:02X}" for b in original_payload)
                     self.log_message.emit(
@@ -223,7 +242,7 @@ class BootloaderWorker(QThread):
 
                     send0_hex = ' '.join(f"{b:02X}" for b in send0_data)
                     self.log_message.emit(f"    → send0={send0_hex}")
-                    time.sleep(0.1)  # 100ms 间隔
+                    time.sleep(0.1)
 
                     # 发送后半包
                     send1_data = bytearray(8)
@@ -239,7 +258,7 @@ class BootloaderWorker(QThread):
 
                     send1_hex = ' '.join(f"{b:02X}" for b in send1_data)
                     self.log_message.emit(f"    → send1={send1_hex}")
-                    time.sleep(0.1)  # 100ms 间隔
+                    time.sleep(0.1)
 
                     # 更新进度
                     current_packet += 1
@@ -277,9 +296,8 @@ class BootloaderWorker(QThread):
                     self.log_message.emit(f"  ✅ 块 {block_index} 确认成功")
                 else:
                     if self._nack_info and self._nack_info[0] == block_index:
-                        nack_block, nack_pkt, nack_half = self._nack_info
-                        half_str = "前半包" if nack_half == 0 else "后半包"
-                        self.log_message.emit(f"  ❌ 收到 NACK: 块 {nack_block}, 包 {nack_pkt}, {half_str}")
+                        nack_block, nack_pkt = self._nack_info
+                        self.log_message.emit(f"  ❌ 块 {nack_block} 收到 NACK: 包 {nack_pkt}")
                         self.finished.emit(False, f"块 {block_index} 校验失败")
                         return
                     else:
@@ -301,18 +319,14 @@ class BootloaderWorker(QThread):
 
     # 供主窗口调用：当收到 ACK/NACK 时
     def on_can_message_received(self, can_id, data):
-        if can_id == 0x200 and len(data) >= 4:
+        if can_id == 0x200 and len(data) >= 3:
             block_idx = data[0]  # 块索引
-            # 包索引（小端序: data[1]=高字节, data[2]=低字节）
-            pkt_idx = (data[1] << 8) | data[2]
-            half_flag = data[3]  # 0x00=前半包, 0x01=后半包
+            pkt_idx = (data[1] << 8) | data[2]  # 包索引（大端）
 
             if block_idx == self._current_block_index:
-                # 存储完整的 NACK 信息（包含半包标志）
-                self._nack_info = (block_idx, pkt_idx, half_flag)
+                self._nack_info = (block_idx, pkt_idx)
                 self._ack_received.set()
-                half_str = "前半包" if half_flag == 0 else "后半包"
-                self.log_message.emit(f"  ❌ 收到 NACK: 块 {block_idx}, 包 {pkt_idx}, {half_str}")
+                self.log_message.emit(f"  ❌ 收到 NACK: 块 {block_idx}, 包 {pkt_idx} → 将重传整个包")
         elif can_id == self._expected_ack_id:
             self._ack_received.set()
 
@@ -329,7 +343,7 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
         self._bootloader_worker = None
         self.first_timestamp = 0
         self._isReceivePressed = True
-        self.selected_hex_file_path = ""  # 存储选中的HEX文件路径
+        self.selected_bin_file_path = ""  # 存储选中的BIN文件路径
         self.DeviceInit()
         self._dev_info = None
         with open("./dev_info.json", "r") as fd:
@@ -343,25 +357,6 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
 
         # 初始化进度条
         self.progressBar.setValue(0)
-
-        # 初始化 Bootloader 状态
-        self._bootloader_active = False
-        self._current_block_index = 0
-        self._total_blocks = 0
-        self._block_data = b""
-        self._block_crc32 = 0
-        self._expected_ack_id = None
-        self._ack_received = threading.Event()
-        self._nack_info = None  # (block_index, packet_index)
-        self._timeout = 10.0  # ACK 超时时间（秒）
-        self._max_retries = 3
-
-        # 用于记录已成功发送的包（避免重复重传）
-        self._sent_packets = set()  # {(block_index, packet_index), ...}
-
-        # 接收线程需能访问这些状态（用于解析 ACK/NACK）
-        self.sent_lock = threading.Lock()
-        self.sent_buffer = {}  # 原有回显缓冲区，保留
 
     def closeEvent(self, event):
         # 关闭设备通道
@@ -513,17 +508,6 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
                     if self._bootloader_worker is not None:
                         self._bootloader_worker.on_can_message_received(can_id, data)
 
-                    # 处理 Bootloader ACK/NACK
-                    if self._bootloader_active:
-                        if can_id == 0x200:  # NACK
-                            if msgs[i].frame.can_dlc >= 4:
-                                block_idx = (msgs[i].frame.data[0] << 8) | msgs[i].frame.data[1]
-                                pkt_idx = (msgs[i].frame.data[2] << 8) | msgs[i].frame.data[3]
-                                self._nack_info = (block_idx, pkt_idx)
-                                self.send_display.append(f"← 收到 NACK：块 {block_idx}, 包 {pkt_idx}")
-                        elif can_id == self._expected_ack_id:  # ACK
-                            self._ack_received.set()
-                            self.send_display.append(f"← 收到 ACK：块 {self._current_block_index}")
                     try:
                         if is_canfd:
                             view = self.CANFDMsg2View(msgs[i], is_send)
@@ -532,54 +516,24 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
                     except Exception as e:
                         print(f"Error processing frame: {e}")
                         continue
-                    # 特殊逻辑处理
-                    if view[1] == '18FF0207':
-                        self.TestSt = 1
-                    # 判断是否为回显帧
-                    current_id = view[1]
-                    current_data = view[5]
-                    is_echo = False
 
-                    with self.sent_lock:
-                        # 生成当前帧的 key 前缀
-                        key_prefix = f"{current_id}_{current_data}"
-
-                        # 遍历缓冲区，找到匹配的条目
-                        matched_key = next((key for key in self.sent_buffer if key.startswith(key_prefix)), None)
-
-                        if matched_key:
-                            view[2] = 'Tx'  # 修改方向为发送
-                            self.sent_buffer.pop(matched_key)  # 移除已匹配条目
-                            is_echo = True
-
-                        self.check_and_convert_signal.emit(view)
+                    self.check_and_convert_signal.emit(view)
 
     def show_message_box(self, title, text, icon=QMessageBox.Information):
-        """
-        显示消息框
-        :param title: 标题
-        :param text: 内容
-        :param icon: 图标类型（QMessageBox.Information / Warning / Critical）
-        """
         msg_box = QMessageBox()
         msg_box.setWindowTitle(title)
         msg_box.setText(text)
-        if title == '错误':
-            msg_box.setIcon(icon)
-        elif title == '成功':
-            msg_box.setIconPixmap(QIcon(icon).pixmap(64, 64))
+        msg_box.setIcon(icon)
         msg_box.setWindowIcon(QIcon('./res/BootLoader.ico'))
         msg_box.exec_()
 
     def BtnOpenCAN_Click(self):
         if self._isChnOpen:
-            # 关闭设备通道
             self._zcan.ResetCAN(self._can_handle)
             self._zcan.CloseDevice(self._dev_handle)
             self._dev_handle = INVALID_DEVICE_HANDLE
             self._can_handle = INVALID_CHANNEL_HANDLE
 
-            # 更新界面状态
             self.btnCANCtrl.setText("打开通道")
             self._isChnOpen = False
             self.cmbDevType.setEnabled(True)
@@ -588,13 +542,11 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
             self._is_canfd = False
 
         else:
-            # 确保之前的资源已清理
             if self._dev_handle != INVALID_DEVICE_HANDLE:
                 self._zcan.CloseDevice(self._dev_handle)
 
             self._cur_dev_info = self._dev_info.get(self.cmbDevType.currentText(), {})
 
-            # Open Device
             self._dev_handle = self._zcan.OpenDevice(
                 self._cur_dev_info.get("dev_type"),
                 0,
@@ -607,15 +559,13 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
             self._is_canfd = self._cur_dev_info.get("chn_info", {}).get("is_canfd", False)
             self._res_support = self._cur_dev_info.get("chn_info", {}).get("sf_res", [])
 
-            # Initial channel
-            if self._res_support:  # resistance enable
+            if self._res_support:
                 ip = self._zcan.GetIProperty(self._dev_handle)
                 self._zcan.SetValue(ip,
                                     str(self.cmbCANChn.currentIndex()) + "/initenal_resistance",
                                     '1' if self.cmbResEnable.currentIndex() == 0 else '0')
                 self._zcan.ReleaseIProperty(ip)
 
-            # set usbcan-e-u baudrate
             if self._cur_dev_info["dev_type"] in USBCAN_XE_U_TYPE:
                 ip = self._zcan.GetIProperty(self._dev_handle)
                 self._zcan.SetValue(ip,
@@ -623,17 +573,13 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
                                     self._cur_dev_info["chn_info"]["baudrate"][self.cmbBaudrate.currentText()])
                 self._zcan.ReleaseIProperty(ip)
 
-            # set usbcanfd clock
             if self._cur_dev_info["dev_type"] in USBCANFD_TYPE:
                 ip = self._zcan.GetIProperty(self._dev_handle)
                 self._zcan.SetValue(ip, str(self.cmbCANChn.currentIndex()) + "/clock", "60000000")
                 self._zcan.ReleaseIProperty(ip)
 
-
-            # 初始化通道配置
             chn_cfg = ZCAN_CHANNEL_INIT_CONFIG()
             chn_cfg.can_type = ZCAN_TYPE_CANFD if self._is_canfd else ZCAN_TYPE_CAN
-
             chn_cfg.config.can.mode = 0
             if self._cur_dev_info["dev_type"] in USBCAN_I_II_TYPE:
                 brt = self._cur_dev_info["chn_info"]["baudrate"][self.cmbBaudrate.currentText()]
@@ -642,13 +588,11 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
                 chn_cfg.config.can.acc_code = 0
                 chn_cfg.config.can.acc_mask = 0xFFFFFFFF
 
-            # 初始化 CAN 通道
             self._can_handle = self._zcan.InitCAN(self._dev_handle, self.cmbCANChn.currentIndex(), chn_cfg)
             if self._can_handle == INVALID_CHANNEL_HANDLE:
                 self.show_message_box("打开通道", "初始化通道失败！", QMessageBox.Critical)
                 return
 
-            # 启动 CAN 通道
             ret = self._zcan.StartCAN(self._can_handle)
             if ret != ZCAN_STATUS_OK:
                 self.show_message_box("打开通道", "打开通道失败！", QMessageBox.Critical)
@@ -661,7 +605,6 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
             self._isChnOpen = True
 
     def select_file(self):
-        """选择BIN文件"""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择BIN文件",
@@ -671,7 +614,6 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
 
         if file_path:
             self.selected_bin_file_path = file_path
-            # 将文件路径显示在lineEdit中
             if hasattr(self, 'lineEdit'):
                 self.lineEdit.setText(file_path)
             print(f"Selected BIN file: {file_path}")
@@ -684,15 +626,12 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
             self.show_message_box("错误", "请先打开CAN通道！", QMessageBox.Critical)
             return
 
-        # 停止之前的传输
         if self._bootloader_worker is not None and self._bootloader_worker.isRunning():
             self._bootloader_worker.stop()
             self._bootloader_worker.wait()
 
-        # 进度条初始化
         self.progressBar.setValue(0)
 
-        # 创建新 worker
         self._bootloader_worker = BootloaderWorker(
             self,
             self.selected_bin_file_path,
@@ -721,21 +660,19 @@ class MainWindows(QtWidgets.QMainWindow, Ui_MainWindow, QtCore.QObject):
         self.pushButton.clicked.connect(self.start_bootloader_burn)
 
         if success:
-            self.show_message_box("成功", message, './res/成功.png')
+            self.show_message_box("成功", message, QMessageBox.Information)
         else:
             self.show_message_box("错误", message, QMessageBox.Critical)
 
     def update_progress_bar(self, current_packet: int, total_packets: int):
-        """按包更新进度条"""
         percentage = int((current_packet / total_packets) * 100)
         self.progressBar.setValue(percentage)
 
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
-    MainWindow = QtWidgets.QMainWindow()
-    # 调自定义的界面（即刚转换的.py对象）
     Ui = MainWindows()
-    Ui.setWindowTitle("BootLoader烧录-V1.2")
+    Ui.setWindowTitle("BootLoader烧录-V1.3")
     Ui.show()
     sys.exit(app.exec_())
+    
